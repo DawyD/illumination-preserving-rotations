@@ -1,7 +1,6 @@
 # Illumination-Preserving Rotations
 
-This is an implementation of the *Defect Segmentation for Multi-Illumination Quality Control Systems* article 
-that presents a novel augmentation technique for multi-illumination datasets. 
+This is an implementation of the [Defect Segmentation for Multi-Illumination Quality Control Systems](https://doi.org/10.1007/s00138-021-01244-z) article that presents a novel augmentation technique for multi-illumination datasets. 
 
 ## Multi-illumination datasets
 
@@ -88,6 +87,8 @@ If you find this work useful, please cite:
   author={Honz{\'a}tko, David and T{\"u}retken, Engin and Bigdeli, Siavash A and Dunbar, L Andrea and Fua, Pascal},
   journal={Machine vision and Applications},
   year={2021},
+  volume={32},
+  number={118},
   publisher={Springer}
 }
 ``` 
