@@ -7,7 +7,7 @@ import logging
 from tensorflow.keras.callbacks import ModelCheckpoint
 from callbacks.testandlog import TestAndLogCallback
 from callbacks.cosinerampscheduler import CosineRampLearningRateScheduler
-from data.dataloader import DataIterator
+from data.dataloader_normals import DataIteratorNormals
 
 import argparse
 import custom_trainer
@@ -20,11 +20,9 @@ from models.deeplabv3plus import DeepLabV3plus
 parser = argparse.ArgumentParser(description='Photometric stereo segmentation')
 parser.add_argument('--seed', '-s', type=int, default=0, help='Random seed')
 parser.add_argument('--epochs', '-e', type=int, default=5000, help='Number of epochs')
-parser.add_argument('--nr_illums', '-i', type=int, default=24, help='Number of illuminations')
 parser.add_argument('--rotations', '-K', type=str, default="rot30",
                     help="Augment data by rotation: None - no rotations, 'rotRND' - random rotation,"
                          "'rot30','rot60','rot90', or 'rot180' - rotation by integer multiples of the angle selected")
-parser.add_argument('--no_illum_pres', action='store_true', help="Do not use illumination preserving rotations")
 parser.add_argument('--arch', '-a', type=str, default="unet",
                     help='Architecture type [unet, dncnn, iternet, fcn, deeplabv3]')
 parser.add_argument('--dataset_path', '-p', type=str, default=None, help='Dataset path')
@@ -36,9 +34,6 @@ parser.add_argument('--memory_limit', '-g', type=int, default=-1,
 parser.add_argument('--optimizer', type=str, default="adam", help="Optimizer")
 parser.add_argument('--save_every', '-v', type=int, default=5000, help='Save model every [V] epochs')
 parser.add_argument('--use_patches', action='store_true', help="Use rather patch_size=128x128, and batch norm")
-parser.add_argument('--dim_reduction', type=str, default=None,
-                    help="None - no reduction, subset of 'albedo,normals' for Lambertian reduction, "
-                         "subset of 'mean,std,skew' for statistical moments reduction")
 parser.add_argument('--drop_rate', type=float, default=0, help='Dropout rate to be used in every layer')
 parser.add_argument('--weight_decay', type=float, default=1e-5, help='L1 weight decay rate')
 parser.add_argument('--keras_only', action='store_true', help="Use keras.fit() instead of the custom training loop")
@@ -73,36 +68,35 @@ if args.dataset_path is None:
 if not os.path.exists(args.dataset_path):
     raise ValueError("Dataset path does not exist")
 
-train_data = DataIterator(base_path=os.path.join(args.dataset_path, "Train"),
-                          sample_nrs=None, illum_nrs=args.nr_illums,
-                          batch_size=args.batch_size, patch_shape=patch_shape, image_shape=(512, 512), channels=1,
-                          dim_reduction=args.dim_reduction, quiet=False, keras_iterator=args.keras_only,
-                          aug_rotation=args.rotations if (args.keras_only or (args.rotations != "rotRND")) else None,
-                          preserve_illumination_channels=(not args.no_illum_pres),
-                          train_mode=True, aug_shift_bright=True, epoch_multiplier=epoch_multiplier)
+train_data = DataIteratorNormals(base_path=os.path.join(args.dataset_path, "Train"),
+                                 sample_nrs=None,
+                                 batch_size=args.batch_size, patch_shape=patch_shape, image_shape=(512, 512),
+                                 quiet=False, keras_iterator=args.keras_only,
+                                 aug_rotation=args.rotations, # if args.keras_only or (args.rotations != "rotRND") else None,
+                                 train_mode=True, aug_shift=True, epoch_multiplier=epoch_multiplier)
 
-test_data = DataIterator(base_path=os.path.join(args.dataset_path, "Test"),
-                         sample_nrs=None, illum_nrs=args.nr_illums,
-                         batch_size=args.batch_size, patch_shape=(512, 512), image_shape=(512, 512), channels=1,
-                         dim_reduction=args.dim_reduction, quiet=False, keras_iterator=args.keras_only,
-                         aug_rotation=None, preserve_illumination_channels=False,
-                         train_mode=False, aug_shift_bright=False)
+test_data = DataIteratorNormals(base_path=os.path.join(args.dataset_path, "Test"),
+                                sample_nrs=None,
+                                batch_size=args.batch_size, patch_shape=(512, 512), image_shape=(512, 512),
+                                quiet=False, keras_iterator=args.keras_only,
+                                aug_rotation=None,
+                                train_mode=False, aug_shift=False)
 
-train_data_to_test = DataIterator(base_path=os.path.join(args.dataset_path, "Train"),
-                                  sample_nrs=None, illum_nrs=args.nr_illums, batch_size=args.batch_size,
-                                  patch_shape=(512, 512), image_shape=(512, 512), channels=1,
-                                  dim_reduction=args.dim_reduction, quiet=False, keras_iterator=args.keras_only,
-                                  aug_rotation=None, preserve_illumination_channels=False,
-                                  train_mode=False, aug_shift_bright=False)
+train_data_to_test = DataIteratorNormals(base_path=os.path.join(args.dataset_path, "Train"),
+                                         sample_nrs=None, batch_size=args.batch_size,
+                                         patch_shape=(512, 512), image_shape=(512, 512),
+                                         quiet=False, keras_iterator=args.keras_only,
+                                         aug_rotation=None,
+                                         train_mode=False, aug_shift=False)
 
 valid_data = None  # Can be used e.g. for early stopping
 
 ''' Define the architecture '''
 
 if args.use_patches:
-    input_shape = (None, None, train_data.sample_channels,)
+    input_shape = (None, None, train_data.channels,)
 else:
-    input_shape = patch_shape + (train_data.sample_channels,)
+    input_shape = patch_shape + (train_data.channels,)
 
 if args.arch == "unet":
     arch = UNet(input_shape,
@@ -183,7 +177,7 @@ if args.keras_only:
         verbose=False, log_dir=log_dir + "/" + model_name,
         scalar_freq=100,
         image_freq=200,
-        channels=3 if args.dim_reduction is not None else None,
+        channels=3,
         epoch_multiplier=epoch_multiplier)
 
     lr_scheduler = CosineRampLearningRateScheduler(
@@ -204,8 +198,8 @@ if args.keras_only:
 else:
     trainer_obj = custom_trainer.Trainer(
         arch,
-        rotate_inputs=False if args.rotations != "rotRND" else "rotRND",
-        rotate_normals=True if (args.dim_reduction is not None) and ("normals" in args.dim_reduction) else False,
+        rotate_inputs=False, # if args.rotations != "rotRND" else "rotRND",
+        rotate_normals=True,
         small_rotate_inputs=False,
         opt_kwargs={'optimizer': args.optimizer})
 

@@ -77,6 +77,14 @@ The code comes in two variants -- custom training loop and simplified keras trai
 (in the paper, we have used a variant with the custom training loop). To select the simplified variant use
 `--keras_only` option, but beware that this variant is not yet fully tested.
 
+### Training with normal maps
+If you are in the possession of the normal maps extracted from the raw images by an external algorithm, you can use:
+```bash
+python train_normals.py --dataset_path=path/to/the/dataset/such/as/Gear/ 
+```
+to train the models. In this script there is no option for illumination preserving rotations and only standard
+rotations are applied. 
+The data have to be in the .mat file format and stored in the variable named `Normals_est`.  
 
 ## Reference
 

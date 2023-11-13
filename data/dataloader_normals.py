@@ -7,6 +7,7 @@ from os import path
 from collections import namedtuple
 import cv2  # for rotations
 from scipy.stats import skew  # for dimensionality reduction
+from scipy.io import loadmat
 from glob import glob
 import math
 
@@ -15,11 +16,11 @@ from tensorflow.keras.utils import Sequence
 import logging
 
 
-class DataIterator(Sequence):
-    def __init__(self, base_path, sample_nrs=None, illum_nrs=24,
-                 batch_size=2, patch_shape=(512, 512), image_shape=(512, 512), channels=1,
-                 train_mode=False, quiet=False, dim_reduction=None, preserve_illumination_channels=True,
-                 aug_rotation=None, aug_shift_bright=False, keras_iterator=True, epoch_multiplier=1):
+class DataIteratorNormals(Sequence):
+    def __init__(self, base_path, sample_nrs=None,
+                 batch_size=2, patch_shape=(512, 512), image_shape=(512, 512),
+                 train_mode=False, quiet=False, aug_rotation=None, aug_shift=False,
+                 keras_iterator=True, epoch_multiplier=1):
         """
         Data generator for multi-illumination image stacks.
         It loads all the samples specified in sample_nrs from the base_path to the memory
@@ -27,27 +28,15 @@ class DataIterator(Sequence):
 
         :param base_path: Path to the dataset
         :param sample_nrs: List of sample numbers to be loaded (e.g. ['defect_001', '026', 'defect_002'])
-        :param illum_nrs: List of image suffixes specifying the order of images in the stack
-               (e.g ['101','201','102','202',...,'112',212']) or an integer (multiply of 12 & >12)
-               or None if all 108 illuminations should be used
         :param batch_size: Number of samples in a batch returned by the generator (e.g. 2)
         :param patch_shape: Shape of patch returned by the generator. If smaller than image_shape a crop is returned.
                (e.g. (512, 512))
         :param image_shape: Shape of source images in the dataset (e.g. (512, 512))
-        :param channels: Either 1 or 3 based on whether to load images as grayscale or as RGB
         :param train_mode: If true, randomly crops and augments the images, If false, all crops are selected
         :param quiet:
-        :param dim_reduction: None - no reduction, subset of "albedo,normals" for Lambertian reduction, 
-                              subset of "mean,std,skew" for statistical moments reduction
-        :param preserve_illumination_channels: If True and aug_rotation equals 'rot30', 'rot60', 'rot90', or 'rot180'
-                   it reshuffles the channels so that the illumination direction after the rotation
-                   remains the same in each channel.
-                   illum_nrs has to be ordered as [elev0_azim0, elev1_azim0, ... ,elev0_azim1, elev1_azim1, ...],
-                   where elev is elevation and azim the azimuth of the illuminatior used while cappturing the image
-                   aug_rotation must correspond to the angle between two adjacent illuminators on the same elevation.
         :param aug_rotation: Augment data by rotation: None - no rotations, 'rotRND' - random rotation,
                              'rot30','rot60','rot90', or 'rot180' - rotation by integer multiples of the angle selected
-        :param aug_shift_bright: Augment data by shifting images by up to +-4px, changing the brightness by up to [+-5]
+        :param aug_shift: Augment data by shifting images by up to +-4px
                                  for uint8 images or by +-0.02 if some dimensionality reduction is applied
         :param keras_iterator: If True, the iterator returns patches, masks, segmentations
                                If False, it also returns whether it has annotations, and locations
@@ -55,37 +44,14 @@ class DataIterator(Sequence):
         """
 
         # Settings for loading the images
-        self.channels = channels
+        self.channels = 3
         self.image_shape = image_shape
-        self.sample_nrs = sample_nrs if sample_nrs is not None else os.listdir(base_path)
+        self.sample_nrs = sample_nrs if sample_nrs is not None else [os.path.basename(p)[:-4] for p in glob(base_path + "/*.mat")]
+        print("Samples:", self.sample_nrs)
         self.total_samples = len(self.sample_nrs)
 
-        all_allowed_illums = [str((i // 12 + 1) * 100 + (i % 12 + 1)) for i in range(108)]
-
-        if illum_nrs is None:
-            self.illum_nrs = np.array([str((i % 9 + 1) * 100 + (i // 9 + 1)) for i in range(108)])
-        elif isinstance(illum_nrs, int) and illum_nrs >= 12 and illum_nrs % 12 == 0:
-            divf = illum_nrs // 12
-            self.illum_nrs = np.array([str((i % divf + 1) * 100 + (i // divf + 1)) for i in range(illum_nrs)])
-        elif hasattr(illum_nrs, "__len__"):
-            self.illum_nrs = np.array(illum_nrs)
-        else:
-            raise ValueError("illum_nrs must be either None, integer "
-                             "(multiple of 12 and >12) or list of illuminations e.g. [101, 102, ...]")
-
-        self.illum_ids = [all_allowed_illums.index(i) for i in self.illum_nrs]
-
-        self.total_illums = len(self.illum_nrs)
-        
-        self.dim_reduction = dim_reduction
-        self.lambertian_reduction = (dim_reduction is not None) and \
-                                    (("normals" in dim_reduction) or ("albedo" in dim_reduction))
-        self.moments_reduction = (dim_reduction is not None) and \
-                                 (("mean" in dim_reduction) or ("std" in dim_reduction) or ("skew" in dim_reduction))
-
-        self.sample_channels = self._get_sample_channels()
         self.patch_shape = patch_shape
-        self.masks_ch_ids = [self.total_illums, self.total_illums + 1]
+        self.masks_ch_ids = [self.channels, self.channels + 1]
 
         # Generator setting
         self.train_mode = train_mode
@@ -99,27 +65,19 @@ class DataIterator(Sequence):
         self.epoch_multiplier = epoch_multiplier
 
         # Augmentation settings:
-        self.preserve_illumination_channels = preserve_illumination_channels
         self.aug_rotation = aug_rotation
-        self.aug_shift_bright = aug_shift_bright
+        self.aug_shift = aug_shift
 
-        self.augment = (not self.aug_shift_bright) \
+        self.augment = (not self.aug_shift) \
                        and (self.aug_rotation is None) \
                        and (self.patch_shape == self.image_shape)
+
+        if (aug_rotation is not None) and (aug_rotation.lower() == "none"):
+            aug_rotation = None
 
         if not ((aug_rotation == 'rot30') or (aug_rotation == 'rot60') or (aug_rotation == 'rot90')
                 or (aug_rotation == 'rot180') or (aug_rotation == 'rotRND') or (aug_rotation is None)):
             raise ValueError("aug_rotation has to be 'rot30','rot60','rot90', 'rot180', 'rotRND', or None")
-
-        if (self.aug_rotation == "rot30" or self.aug_rotation == "rot60" or self.aug_rotation == "rot90" or
-            self.aug_rotation == "rot180") and self.preserve_illumination_channels and self.dim_reduction:
-            raise ValueError("Illumination preserving rotations cannot be"
-                             " combined with dimensionality reduction techniques")
-
-        if self.aug_rotation is not None and self.aug_rotation != "rot30" and self.aug_rotation != "rot60" and \
-           self.aug_rotation != "rot90" and self.aug_rotation != "rot180" and self.preserve_illumination_channels:
-            raise ValueError("Preserving channel ordering after augmentation is possible only when using "
-                             "'rot30', 'rot60', 'rot90', or 'rot180' rotations")
 
         if self.aug_rotation == "rot30":
             self.prerotate_angle = 30
@@ -133,9 +91,6 @@ class DataIterator(Sequence):
         elif (self.aug_rotation == "rot60") or (self.aug_rotation == "rot180"):
             self.illum_pres_rot_angle = 180
         else:
-            if self.preserve_illumination_channels:
-                logging.warning("Illumination-preserving rotations are"
-                                " not available for {} rotation.".format(self.aug_rotation))
             self.illum_pres_rot_angle = 0
 
         start = time.time()
@@ -166,7 +121,6 @@ class DataIterator(Sequence):
                 ar="masks", sh=self.data[..., -2:-1].shape, sze=self.data[..., -2:-1].nbytes / 1024 / 1024,
                 min=np.amin(self.data[..., -2:-1]), max=np.amax(self.data[..., -2:-1]), dt=self.data[..., -2:-1].dtype))
             logging.info("Epoch size: %d" % self.length)
-            logging.info("Views to consider:", self.illum_nrs)
             if not train_mode:
                 logging.info("Test_locations: %d" % len(self.locations))
 
@@ -175,8 +129,7 @@ class DataIterator(Sequence):
             else:
                 logging.info("Augmentations:")
                 logging.info("  Rotation:", self.aug_rotation)
-                logging.info("  Channel order preserved if possible", self.preserve_illumination_channels)
-                logging.info("  Brightness+Shifts:", self.aug_shift_bright)
+                logging.info("  Shifts:", self.aug_shift)
 
     def __getitem__(self, idx):
         """
@@ -223,35 +176,11 @@ class DataIterator(Sequence):
         :return: Boolean foreground segmentation mask
         :return: Boolean defect segmentation mask
         """
-        images = patches[..., :(self.channels * self.sample_channels)].astype(np.float32)
-        segmentations = patches[..., -1].astype(np.float32)[..., None]
-        masks = patches[..., -2].astype(np.float32)[..., None]
+        images = patches[..., :self.channels]
+        segmentations = patches[..., -1][..., None] > 0
+        masks = patches[..., -2][..., None] > 0
 
-        if not self.dim_reduction:
-            return images / 255., segmentations / 255., masks / 255.
-        else:
-            return images, segmentations, masks
-
-    def _get_sample_channels(self):
-        """
-        Gets the number of channels for sample based on the number of illuminations,
-         channels, and dimensionality reduction technique
-        :return: Number of channels per sample (excluding the masks)
-        """
-        if self.dim_reduction is None:
-            return self.total_illums * self.channels
-        total_nr_channels = 0
-        if "mean" in self.dim_reduction:
-            total_nr_channels += 1
-        if "std" in self.dim_reduction:
-            total_nr_channels += 1
-        if "skew" in self.dim_reduction:
-            total_nr_channels += 1
-        if "normals" in self.dim_reduction:
-            total_nr_channels += 3
-        if "albedo" in self.dim_reduction:
-            total_nr_channels += 1
-        return total_nr_channels
+        return images * segmentations, segmentations, masks
     
     @staticmethod
     def _rotate_vectors(vectors, angle):
@@ -280,190 +209,87 @@ class DataIterator(Sequence):
         # Check the directory
 
         # Allocate the data
-        data_dtype = np.uint8 if self.dim_reduction is None else np.float32
         mask_channels = 2
         # In case of rotation by 30 or 60, preload the rotated versions to memory
         total_nr_samples = self.total_samples if self.prerotate_angle == 0 else self.total_samples*3
 
-        data = np.zeros((total_nr_samples,) + self.image_shape + (self.sample_channels + mask_channels,), dtype=data_dtype)
+        data = np.zeros((total_nr_samples,) + self.image_shape + (self.channels + mask_channels,), dtype=np.float32)
         has_annotations = np.zeros((self.total_samples,), dtype=np.bool_)
 
-        if self.lambertian_reduction:
-            light_currents = np.genfromtxt(path.join(base_path, '..', 'light_currents.csv'), delimiter=',')[self.illum_ids]
-            light_intensities = light_currents / np.max(light_currents)
-            light_vectors = np.genfromtxt(path.join(base_path, '..', 'light_vectors.csv'), delimiter=',')[self.illum_ids]
-            coeff = []
-            LNY = []
-            invYLYLT = []
-            for i in range(1 if self.prerotate_angle == 0 else 3):
-                L = self._rotate_vectors(light_vectors, self.prerotate_angle*i)
-                # for albedo estimation
-                LN = L.dot([0, 0, 1])
-                LNY.append(LN * light_intensities)
-                coeff.append(1. / np.dot(LNY[i], LNY[i]))
-                # for normals estimation
-                YL = L * light_intensities[:, None]
-                invYL = np.linalg.inv(np.matmul(YL.T, YL))
-                invYLYLT.append(np.matmul(invYL, YL.T))
-        else:
-            coeff = None
-            LNY = None
-            invYLYLT = None
-
-        raw_sample_channels = self.channels * self.total_illums + mask_channels
+        raw_sample_channels = self.channels + mask_channels
         # For each sample
-        for j, sample_dir in enumerate(self.sample_nrs):
-            seg_filename = glob(path.join(base_path, sample_dir) + "/*_segmentation.png")[0]
-            prefix = path.basename(seg_filename).split("_")[0]
-            mask_filename = path.join(base_path, sample_dir, prefix + "_" + sample_dir + "_mask.png")
+        for j, sample_nr in enumerate(self.sample_nrs):
+            seg_filename = path.join(base_path, sample_nr + "_segmentation.png")
+            mask_filename = path.join(base_path, sample_nr + "_mask.png")
             
             # Load foreground segmentation mask
             with Image.open(seg_filename) as seg:
-                sampledata = np.zeros(seg.size[::-1] + (raw_sample_channels,), dtype=np.uint8)
+                sampledata = np.zeros(seg.size[::-1] + (raw_sample_channels,), dtype=np.float32)
                 if seg.mode == "LA":
-                    sampledata[..., -1] = np.array(seg, dtype=np.uint8)[..., 0]
+                    sampledata[..., -1] = (np.array(seg) > 0).astype(np.float32)[..., 0]
                 else:
-                    sampledata[..., -1] = np.array(seg, dtype=np.uint8)
+                    sampledata[..., -1] = (np.array(seg) > 0).astype(np.float32)
 
             # Load defect segmentation mask
             if mask_filename is not None and path.isfile(mask_filename):
                 with Image.open(mask_filename) as maskf:
                     if maskf.mode == "LA":
-                        sampledata[..., -2] = np.array(maskf, dtype=np.uint8)[..., 0]
+                        sampledata[..., -2] = (np.array(maskf) > 0).astype(np.float32)[..., 0]
                     else:
-                        sampledata[..., -2] = np.array(maskf, dtype=np.uint8)
+                        sampledata[..., -2] = (np.array(maskf) > 0).astype(dtype=np.float32)
 
                 has_annotations[j] = True
 
             # Load stack of images
-            for i, illum_nr in enumerate(self.illum_nrs):
-                image_filename = path.join(base_path, sample_dir, prefix + "_" + sample_dir + "_" + illum_nr + ".png")
-                with Image.open(image_filename) as image:
-                    if self.channels == 1 and image.mode in ["RGB", "RGBA", "CMYK", "YCbCr", "LAB", "HSV"]:
-                        image = image.convert(mode="L")
-                        image = np.array(image, dtype=np.uint8)[..., np.newaxis]
-                    else:
-                        image = np.array(image, dtype=np.uint8)[..., self.channels]
 
-                    sampledata[..., i*self.channels:(i+1)*self.channels] = image
+            sampledata[..., :self.channels] = loadmat(path.join(base_path, sample_nr + ".mat"))["Normal_est"]
 
-            if self.dim_reduction is None:
-                for k in range(1 if self.prerotate_angle == 0 else 3):
-                    rot_sampledata = self.rotate(sampledata, k*self.prerotate_angle, interp="bicubic")
-                    if self.preserve_illumination_channels and k > 0:
-                        channel_shift = self.sample_channels // (360 // self.prerotate_angle)
-                        ids = np.concatenate((np.roll(np.arange(self.sample_channels), k * channel_shift), self.masks_ch_ids))
-                        rot_sampledata = rot_sampledata[..., ids]
-                    data[j + k*self.total_samples] = rot_sampledata
-            elif self.moments_reduction:
-                for k in range(1 if self.prerotate_angle == 0 else 3):
-                    data[j + k*self.total_samples] = self._reduce_moments(self.rotate(sampledata, k*self.prerotate_angle, interp="bicubic"))
-            elif self.lambertian_reduction:
-                for k in range(1 if self.prerotate_angle == 0 else 3):
-                    data[j + k*self.total_samples] = self._reduce_lambertian(self.rotate(sampledata, k*self.prerotate_angle, interp="bicubic"), coeff[0], LNY[0], invYLYLT[0])
-            else:
-                raise ValueError("Unknown dimensionality reduction")
+            for k in range(1 if self.prerotate_angle == 0 else 3):
+                rot_sampledata = self.rotate(sampledata, k*self.prerotate_angle, interp="bicubic")
+
+                # Rotate the XY normals
+                rad_rot = -np.deg2rad(k*self.prerotate_angle)
+                rot_matrices = np.stack([(np.cos(rad_rot), -np.sin(rad_rot)),
+                                         (np.sin(rad_rot), np.cos(rad_rot))], axis=0)  # [x, y]
+                rot_sampledata[..., :2] = np.matmul(rot_sampledata[..., :2], rot_matrices)
+
+                data[j + k*self.total_samples] = rot_sampledata
 
         return data, has_annotations
-    
-    def _reduce_moments(self, in_array):
-        """
-        Given an input array it computes the moemnts along the first self.total_illums channels, 
-        it stacks these moments along the channel dimension and keeps the rest of the channels unchanged
-        :param in_array: Input array
-        :return: Array with reduced number of channels
-        """
-        featuresstack = []
-        feats = in_array[..., :self.total_illums] / 255.
-        if "mean" in self.dim_reduction:
-            featuresstack.append(feats.mean(axis=-1, keepdims=True))
-        if "std" in self.dim_reduction:
-            featuresstack.append(feats.std(axis=-1, keepdims=True))
-        if "skew" in self.dim_reduction:
-            featuresstack.append(skew(feats, axis=-1)[..., np.newaxis])
-        featuresstack.append(in_array[..., self.total_illums:] / 255.)
-        return np.concatenate(featuresstack, axis=-1)
-        
-    def _reduce_lambertian(self, in_array, coef, LNY, invYLYLT):
-        """
-        Given an input array it computes the lambertain normals or/and albedo from the first self.total_illums channels, 
-        it stacks these quantities along the channel dimension and keeps the rest of the channels unchanged
-        :param in_array: Input array
-        :param coef: Precomputed coeff for computing albedo
-        :param LNY: Precomputed dot(light_direction, normal_driection)*light_intensity
-        :param invYLYLT: Precomputed matmul(inv(np.matmul(YL.T, YL)), YL.T), where YL = L * light_intensities
-        :return: Array with reduced number of channels
-        """
-        shape = in_array.shape
-        images = np.reshape(in_array[..., :self.total_illums], (shape[0]*shape[1], -1)).T
-        if "albedo" in self.dim_reduction and "normals" in self.dim_reduction:
-            N = np.matmul(invYLYLT, images / 255.)
-            albedo = np.linalg.norm(N, axis=0)[None, ...]
-            np.divide(N, albedo, out=N, where=albedo > 0)
-            N = np.concatenate((N, albedo), axis=0)
-            normals = N.T.reshape((shape[0], shape[1], -1))
-            return np.concatenate((normals, (in_array[..., self.total_illums:] / 255.)), axis=-1)
-        elif "normals" in self.dim_reduction:
-            N = np.matmul(invYLYLT, images / 255.)
-            normals = N.T.reshape((shape[0], shape[1], -1))
-            return np.concatenate((normals, (in_array[..., self.total_illums:] / 255.)), axis=-1)
-        elif "albedo" in self.dim_reduction:
-            albedo = coef * np.matmul(LNY, images / 255.).reshape((shape[0], shape[1], 1))
-            return np.concatenate((albedo, (in_array[..., self.total_illums:] / 255.)), axis=-1)
-
-    def augment_fn(self, in_array, do_shift, do_brightness,
+    def augment_fn(self, in_array, do_shift,
                    illum_pres_rot_angle, do_arb_rotation, bb):
         in_array = np.copy(in_array)
 
         if illum_pres_rot_angle != 0:
             if illum_pres_rot_angle == 90:
-                k_roll = np.random.randint(4)
-                k_rot = k_roll
+                k_rot = np.random.randint(4)
             elif illum_pres_rot_angle == 180:
-                k_roll = np.random.randint(2)
-                k_rot = k_roll * 2
+                k_rot = np.random.randint(2) * 2
             else:
                 raise ValueError("Only 90 and 180 degrees are supported")
 
-            if self.preserve_illumination_channels:
-                channel_shift = self.sample_channels // (360 // illum_pres_rot_angle)
-                ids = np.roll(np.arange(self.sample_channels), k_roll * channel_shift)
-                ids = np.concatenate((ids, self.masks_ch_ids))
-                in_array = np.rot90(in_array, k=k_rot)[..., ids]
-            else:
-                in_array = np.rot90(in_array, k=k_rot)
+            in_array = np.rot90(in_array, k=k_rot)
 
-            if self.lambertian_reduction and "normals" in self.dim_reduction:
-                rad_rot = -np.deg2rad(90 * k_rot)
-                rot_matrices = np.stack([(np.cos(rad_rot), -np.sin(rad_rot)),
-                                         (np.sin(rad_rot), np.cos(rad_rot))], axis=0)  # [x, y]
+            rad_rot = -np.deg2rad(90 * k_rot)
+            rot_matrices = np.stack([(np.cos(rad_rot), -np.sin(rad_rot)),
+                                     (np.sin(rad_rot), np.cos(rad_rot))], axis=0)  # [x, y]
 
-                in_array[..., :2] = np.matmul(in_array[..., :2], rot_matrices)
-
-        if do_brightness:
-            if self.dim_reduction is not None:
-                brightness_shift = np.float32(np.random.uniform(-(5/255), 5/255))
-                in_array[..., :self.sample_channels] += brightness_shift
-            else:
-                brightness_shift = np.random.randint(-5, 6, dtype=np.int16)
-                imgs = np.cast[np.int16](in_array[..., :self.sample_channels]) + brightness_shift
-                in_array[..., :self.sample_channels] = np.clip(imgs, 0, 255).astype(np.uint8)
+            in_array[..., :2] = np.matmul(in_array[..., :2], rot_matrices)
 
         if do_arb_rotation:
-            angle = np.random.randint(-359, 360)
+            angle = np.random.randint(0, 360)
             if angle < 0:
                 in_array = np.fliplr(in_array)
             in_array = self.rotate(in_array, np.abs(angle))
 
-            if self.lambertian_reduction and "normals" in self.dim_reduction:
-                rad_rot = -np.deg2rad(np.abs(angle))
-                rot_matrices = np.stack([(np.cos(rad_rot), -np.sin(rad_rot)),
-                                         (np.sin(rad_rot), np.cos(rad_rot))], axis=0)  # [x, y]
+            rad_rot = -np.deg2rad(np.abs(angle))
+            rot_matrices = np.stack([(np.cos(rad_rot), -np.sin(rad_rot)),
+                                     (np.sin(rad_rot), np.cos(rad_rot))], axis=0)  # [x, y]
 
-                in_array[..., :2] = np.matmul(in_array[..., :2], rot_matrices)
+            in_array[..., :2] = np.matmul(in_array[..., :2], rot_matrices)
 
-                if angle < 0:
-                    in_array = np.concatenate((-in_array[..., 0:1], in_array[..., 1:]), axis=-1)
+            if angle < 0:
+                in_array *= [[[-1, 1, 1]]] # = np.concatenate((-in_array[..., :1], in_array[..., 1:]), axis=-1)
 
         if do_shift:
             shift = np.random.randint(-4, 5, size=2)
@@ -520,8 +346,7 @@ class DataIterator(Sequence):
                                   self.data.shape[-1]), dtype=self.data.dtype)
             for j, loc in enumerate(locations):
                 out_array[j] = self.augment_fn(self.data[loc[0]],
-                                               do_shift=self.aug_shift_bright,
-                                               do_brightness=self.aug_shift_bright,
+                                               do_shift=self.aug_shift,
                                                illum_pres_rot_angle=self.illum_pres_rot_angle,
                                                do_arb_rotation=self.aug_rotation == "rotRND",
                                                bb=(loc[1], loc[2]))
@@ -604,7 +429,7 @@ class DataIterator(Sequence):
         former_type = in_array.dtype
         former_shape = in_array.shape
 
-        if in_array.dtype == np.bool:
+        if in_array.dtype == np.bool_:
             in_array = np.cast[np.uint8](in_array)
 
         if len(in_array.shape) > 3:
@@ -618,40 +443,17 @@ class DataIterator(Sequence):
 
         out = out.reshape(former_shape)
 
-        if former_type == np.bool:
+        if former_type == np.bool_:
             return out > 0.5
         else:
             return out
 
     def get_name(self):
-        DR = ""
-        if self.dim_reduction is not None:
-            if "mean" in self.dim_reduction:
-                DR += "mu"
-            if "std" in self.dim_reduction:
-                DR += "std"
-            if "skew" in self.dim_reduction:
-                DR += "skw"
-            if "albedo" in self.dim_reduction:
-                DR += "alb"
-            if "normals" in self.dim_reduction:
-                DR += "nml"
-            if DR != "":
-                DR = "-DimR" + DR
-
-        no_illum_pres_rot = ""
-        if (self.aug_rotation == "rot30" or self.aug_rotation == "rot60" or self.aug_rotation == "rot90" or
-            self.aug_rotation == "rot180") and (not self.preserve_illumination_channels):
-            no_illum_pres_rot = "-noillumpres"
-
         patch_shape = ""
         if self.patch_shape != (512, 512):
             patch_shape = "P" + str(self.patch_shape[0])
 
-        return "{patch}K{rot}{no_illum_pres}-I{illums}{DR}".format(
+        return "{patch}K{rot}".format(
             patch=patch_shape,
             rot=self.aug_rotation,
-            no_illum_pres=no_illum_pres_rot,
-            illums=len(self.illum_nrs),
-            DR=DR
         )

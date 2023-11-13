@@ -144,25 +144,25 @@ class Trainer:
             segmentations = tfa.image.rotate(segmentations, angles_rad, interpolation='NEAREST', name="rotate_segmentation")
             masks = tfa.image.rotate(masks, angles_rad, interpolation='NEAREST', name="rotate_masks")
 
-            if self.rotate_normals:  # Rotate normal directions (x,y) assuming order of channels: [albedo, x, y, z]
+            if self.rotate_normals:  # Rotate normal directions (x,y) assuming order of channels: [x, y, z]
                 rot_matrices = tf.expand_dims(
                     tf.expand_dims(
                         tf.transpose(
-                            tf.stack([(tf.cos(angles_rad), -tf.sin(angles_rad)),
-                                      (tf.sin(angles_rad), tf.cos(angles_rad))], axis=0),
+                            tf.stack([(tf.cos(-angles_rad), -tf.sin(-angles_rad)),
+                                      (tf.sin(-angles_rad), tf.cos(-angles_rad))], axis=0),
                             (1, 0, 2)),
                         axis=1),
                     axis=1)  # [batch_size, 1, 1, x, y]
                 normals_xy = tf.expand_dims(images[..., 0:2], axis=4)  # [batch_size, height, width, xy, 1]
                 rot_normals = tf.matmul(rot_matrices, normals_xy)
-                images = tf.concat((rot_normals[..., 0], images[..., 2:]), axis=-1)
+                images = tf.concat((rot_normals[..., :2], images[..., 2:]), axis=-1)
 
             if tf.random.uniform(()) > 0.5:  # Randomly flop the image
                 images = tf.image.flip_left_right(images)
                 segmentations = tf.image.flip_left_right(segmentations)
                 masks = tf.image.flip_left_right(masks)
                 if self.rotate_normals:
-                    images = tf.concat((-images[..., 0:1], images[..., 1:]), axis=-1)
+                    images *= [[[-1, 1, 1]]]
 
         if self.small_rotate_inputs:
             logging.info("Adding small random image rotations of +-4deg")
